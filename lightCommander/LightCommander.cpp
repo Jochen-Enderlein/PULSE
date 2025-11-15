@@ -1,5 +1,4 @@
 #include "LightCommander.h"
-#include <SPIFFS.h>
 
 // ============================================================================
 // KONSTRUKTOR & INITIALISIERUNG
@@ -9,75 +8,81 @@ LightCommander::LightCommander() :
     server(80),
     isAPMode(false),
     currentSequence(nullptr),
-    currentEventIndex(0),
-    spotifyConnected(false) {
+    currentEventIndex(0) {
 }
 
 void LightCommander::begin(const char* ssid, const char* password, bool apMode) {
     Serial.begin(115200);
-    Serial.println("\n=== Light Commander Starting ===");
+    Serial.println("\n╔════════════════════════════════════════╗");
+    Serial.println("║     LIGHT COMMANDER                     ║");
+    Serial.println("║     Master-Controller für Scheinwerfer ║");
+    Serial.println("╚════════════════════════════════════════╝\n");
     
     wifiSSID = String(ssid);
     wifiPassword = String(password);
     isAPMode = apMode;
     
-    // SPIFFS initialisieren (für Sequenz-Speicherung)
-    if (!SPIFFS.begin(true)) {
-        Serial.println("SPIFFS Mount Failed");
-    }
-    
     // WiFi Setup
     if (isAPMode) {
-        Serial.println("Starting Access Point Mode...");
+        Serial.println("📡 Starting Access Point Mode...");
         WiFi.softAP(ssid, password);
+        Serial.print("AP SSID: ");
+        Serial.println(ssid);
         Serial.print("AP IP: ");
         Serial.println(WiFi.softAPIP());
     } else {
-        Serial.println("Connecting to WiFi...");
+        Serial.println("📡 Connecting to WiFi...");
+        Serial.print("SSID: ");
+        Serial.println(ssid);
+        
+        WiFi.mode(WIFI_STA);
         WiFi.begin(ssid, password);
         
         int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        while (WiFi.status() != WL_CONNECTED && attempts < 40) {
             delay(500);
             Serial.print(".");
             attempts++;
         }
         
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\nConnected!");
+            Serial.println("\n✓ WiFi connected!");
             Serial.print("IP: ");
             Serial.println(WiFi.localIP());
+            Serial.print("Signal: ");
+            Serial.print(WiFi.RSSI());
+            Serial.println(" dBm");
         } else {
-            Serial.println("\nFailed to connect. Starting AP Mode...");
-            Serial.print(WiFi.status());
+            Serial.println("\n✗ WiFi connection failed!");
+            Serial.println("Starting AP Mode as fallback...");
             WiFi.softAP(ssid, password);
             isAPMode = true;
+            Serial.print("AP IP: ");
+            Serial.println(WiFi.softAPIP());
         }
     }
     
-    // REST API Routes einrichten
+    // REST API Setup
     setupRoutes();
     server.begin();
     
-    Serial.println("Light Commander Ready!");
+    Serial.println("\n✓ Light Commander ready!");
+    Serial.println("Waiting for spotlight connections...\n");
 }
 
 void LightCommander::loop() {
     server.handleClient();
     
-    // Rotation-Effekte aktualisieren
-    updateRotationEffects();
-    
-    // Sequenz-Playback aktualisieren
+    // Sequenz-Playback
     if (playback.active && !playback.paused) {
         updateSequencePlayback();
     }
     
-    // Periodisch Scheinwerfer-Status prüfen (alle 10 Sekunden)
-    static unsigned long lastStatusCheck = 0;
-    if (millis() - lastStatusCheck > 10000) {
+    // Periodischer Health-Check (alle 30 Sekunden)
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck > 30000) {
         checkSpotlightStatus();
-        lastStatusCheck = millis();
+        lastCheck = millis();
     }
 }
 
@@ -86,48 +91,71 @@ void LightCommander::loop() {
 // ============================================================================
 
 void LightCommander::setupRoutes() {
-    // Status & Info
     server.on("/", HTTP_GET, [this]() { handleRoot(); });
-    server.on("/api/status", HTTP_GET, [this]() { handleGetStatus(); });
+    server.on("/api/status", HTTP_GET, [this]() { handleStatus(); });
     
-    // Scheinwerfer-Management
     server.on("/api/spotlight/add", HTTP_POST, [this]() { handleAddSpotlight(); });
     server.on("/api/spotlight/list", HTTP_GET, [this]() { handleListSpotlights(); });
     
-    // Effekte
     server.on("/api/effect/send", HTTP_POST, [this]() { handleSendEffect(); });
     server.on("/api/effect/stop", HTTP_POST, [this]() { handleStopEffect(); });
     
-    // Sequenzen
     server.on("/api/sequence/load", HTTP_POST, [this]() { handleLoadSequence(); });
     server.on("/api/sequence/list", HTTP_GET, [this]() { handleListSequences(); });
     server.on("/api/sequence/play", HTTP_POST, [this]() { handlePlaySequence(); });
     server.on("/api/sequence/pause", HTTP_POST, [this]() { handlePauseSequence(); });
+    server.on("/api/sequence/resume", HTTP_POST, [this]() { handleResumeSequence(); });
     server.on("/api/sequence/stop", HTTP_POST, [this]() { handleStopSequence(); });
 }
 
 void LightCommander::handleRoot() {
-    String html = "<!DOCTYPE html><html><head><title>Light Commander</title></head><body>";
-    html += "<h1>Light Commander Control Panel</h1>";
-    html += "<h2>API Endpoints:</h2>";
-    html += "<ul>";
-    html += "<li>GET /api/status - System status</li>";
+    String html = "<!DOCTYPE html><html><head><title>Light Commander</title>";
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<style>body{font-family:Arial;margin:20px;background:#1a1a1a;color:#fff;}";
+    html += "h1{color:#00aaff;}ul{line-height:1.8;}</style></head><body>";
+    html += "<h1>🎆 Light Commander</h1>";
+    html += "<h2>Connected Spotlights:</h2><ul>";
+    
+    for (auto& pair : spotlights) {
+        html += "<li>" + pair.second.name + " (" + pair.second.id + ") - ";
+        html += pair.second.online ? "🟢 Online" : "🔴 Offline";
+        html += " @ " + pair.second.ip + "</li>";
+    }
+    if (spotlights.empty()) {
+        html += "<li>No spotlights connected</li>";
+    }
+    
+    html += "</ul><h2>Loaded Sequences:</h2><ul>";
+    for (auto& pair : sequences) {
+        html += "<li>" + pair.second.name + " (" + pair.second.id + ") - ";
+        html += String(pair.second.events.size()) + " events, ";
+        html += String(pair.second.duration / 1000) + "s</li>";
+    }
+    if (sequences.empty()) {
+        html += "<li>No sequences loaded</li>";
+    }
+    
+    html += "</ul><h2>Playback Status:</h2><p>";
+    if (playback.active) {
+        html += "▶️ Playing: " + playback.currentSequence;
+        if (playback.paused) html += " (PAUSED)";
+    } else {
+        html += "⏹️ Stopped";
+    }
+    
+    html += "</p><h2>API Endpoints:</h2><ul>";
     html += "<li>POST /api/spotlight/add - Add spotlight</li>";
     html += "<li>GET /api/spotlight/list - List spotlights</li>";
     html += "<li>POST /api/effect/send - Send effect</li>";
-    html += "<li>POST /api/effect/stop - Stop effect</li>";
     html += "<li>POST /api/sequence/load - Load sequence</li>";
-    html += "<li>GET /api/sequence/list - List sequences</li>";
     html += "<li>POST /api/sequence/play - Play sequence</li>";
-    html += "<li>POST /api/sequence/pause - Pause sequence</li>";
-    html += "<li>POST /api/sequence/stop - Stop sequence</li>";
-    html += "</ul>";
-    html += "</body></html>";
+    html += "<li>GET /api/status - Get status</li>";
+    html += "</ul></body></html>";
     
     server.send(200, "text/html", html);
 }
 
-void LightCommander::handleGetStatus() {
+void LightCommander::handleStatus() {
     server.send(200, "application/json", getStatusJson());
 }
 
@@ -138,9 +166,7 @@ void LightCommander::handleAddSpotlight() {
     }
     
     StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
-    
-    if (error) {
+    if (deserializeJson(doc, server.arg("plain"))) {
         server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         return;
     }
@@ -148,11 +174,6 @@ void LightCommander::handleAddSpotlight() {
     String id = doc["id"] | "";
     String name = doc["name"] | "";
     String ip = doc["ip"] | "";
-    
-    if (id.isEmpty() || ip.isEmpty()) {
-        server.send(400, "application/json", "{\"error\":\"Missing id or ip\"}");
-        return;
-    }
     
     if (addSpotlight(id, name, ip)) {
         server.send(200, "application/json", "{\"success\":true}");
@@ -171,8 +192,6 @@ void LightCommander::handleListSpotlights() {
         obj["name"] = pair.second.name;
         obj["ip"] = pair.second.ip;
         obj["online"] = pair.second.online;
-        obj["innerLeds"] = pair.second.innerLedCount;
-        obj["outerLeds"] = pair.second.outerLedCount;
     }
     
     String output;
@@ -186,22 +205,25 @@ void LightCommander::handleSendEffect() {
         return;
     }
     
-    StaticJsonDocument<2048> doc;
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
+    String body = server.arg("plain");
+    Serial.println("\n📥 Received effect command:");
+    Serial.println(body);
     
-    if (error) {
+    StaticJsonDocument<2048> doc;
+    if (deserializeJson(doc, body)) {
+        Serial.println("✗ JSON parse error!");
         server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         return;
     }
     
-    // Ziele parsen
+    // Targets parsen
     std::vector<String> targets;
     JsonArray targetsArray = doc["targets"];
     for (JsonVariant v : targetsArray) {
         targets.push_back(v.as<String>());
     }
     
-    // Ring-Typ
+    // Ring
     String ringStr = doc["ring"] | "both";
     RingType ring = RING_BOTH;
     if (ringStr == "inner") ring = RING_INNER;
@@ -220,20 +242,20 @@ void LightCommander::handleSendEffect() {
     // Parameter
     EffectParams params;
     if (doc.containsKey("color")) {
-        JsonArray colorArray = doc["color"];
-        params.color = Color(colorArray[0], colorArray[1], colorArray[2]);
+        JsonArray c = doc["color"];
+        params.color = Color(c[0], c[1], c[2]);
     }
-    if (doc.containsKey("brightness")) {
-        params.brightness = doc["brightness"];
+    if (doc.containsKey("color2")) {
+        JsonArray c2 = doc["color2"];
+        params.color2 = Color(c2[0], c2[1], c2[2]);
     }
-    if (doc.containsKey("duration")) {
-        params.duration = doc["duration"];
-    }
+    if (doc.containsKey("brightness")) params.brightness = doc["brightness"];
+    if (doc.containsKey("speed")) params.speed = doc["speed"];
+    if (doc.containsKey("duration")) params.duration = doc["duration"];
     
-    // Rotations-spezifische Parameter
+    // Rotation params
     if (effect == EFFECT_ROTATION && doc.containsKey("rotation")) {
         JsonObject rot = doc["rotation"];
-        
         if (rot.containsKey("activeColor")) {
             JsonArray ac = rot["activeColor"];
             params.rotation.activeColor = Color(ac[0], ac[1], ac[2]);
@@ -242,9 +264,7 @@ void LightCommander::handleSendEffect() {
             JsonArray ic = rot["inactiveColor"];
             params.rotation.inactiveColor = Color(ic[0], ic[1], ic[2]);
         }
-        if (rot.containsKey("speed")) {
-            params.rotation.speed = rot["speed"];
-        }
+        if (rot.containsKey("speed")) params.rotation.speed = rot["speed"];
         if (rot.containsKey("direction")) {
             String dir = rot["direction"] | "clockwise";
             params.rotation.direction = (dir == "counterclockwise") ? 
@@ -255,19 +275,14 @@ void LightCommander::handleSendEffect() {
             if (pat == "trail") params.rotation.pattern = PATTERN_TRAIL;
             else if (pat == "opposite") params.rotation.pattern = PATTERN_OPPOSITE;
             else if (pat == "wave") params.rotation.pattern = PATTERN_WAVE;
-            else if (pat == "rainbow_chase") params.rotation.pattern = PATTERN_RAINBOW_CHASE;
-        }
-        if (rot.containsKey("trailFade")) {
-            params.rotation.trailFade = rot["trailFade"];
+            else params.rotation.pattern = PATTERN_SINGLE;
         }
         if (rot.containsKey("trailLength")) {
             params.rotation.trailLength = rot["trailLength"];
         }
-        if (rot.containsKey("startOffset")) {
-            params.rotation.startOffset = rot["startOffset"];
-        }
     }
     
+    // Senden!
     if (sendEffect(targets, ring, effect, params)) {
         server.send(200, "application/json", "{\"success\":true}");
     } else {
@@ -282,9 +297,7 @@ void LightCommander::handleStopEffect() {
     }
     
     StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
-    
-    if (error) {
+    if (deserializeJson(doc, server.arg("plain"))) {
         server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         return;
     }
@@ -295,10 +308,15 @@ void LightCommander::handleStopEffect() {
         targets.push_back(v.as<String>());
     }
     
-    if (stopEffect(targets)) {
+    String ringStr = doc["ring"] | "both";
+    RingType ring = RING_BOTH;
+    if (ringStr == "inner") ring = RING_INNER;
+    else if (ringStr == "outer") ring = RING_OUTER;
+    
+    if (stopEffect(targets, ring)) {
         server.send(200, "application/json", "{\"success\":true}");
     } else {
-        server.send(500, "application/json", "{\"error\":\"Failed to stop effect\"}");
+        server.send(500, "application/json", "{\"error\":\"Failed to stop\"}");
     }
 }
 
@@ -318,11 +336,11 @@ void LightCommander::handleLoadSequence() {
 void LightCommander::handleListSequences() {
     std::vector<String> seqList = listSequences();
     
-    StaticJsonDocument<1024> doc;
+    StaticJsonDocument<2048> doc;
     JsonArray array = doc.to<JsonArray>();
     
-    for (const String& seqId : seqList) {
-        Sequence* seq = getSequence(seqId);
+    for (const String& id : seqList) {
+        Sequence* seq = getSequence(id);
         if (seq) {
             JsonObject obj = array.createNestedObject();
             obj["id"] = seq->id;
@@ -344,16 +362,14 @@ void LightCommander::handlePlaySequence() {
     }
     
     StaticJsonDocument<256> doc;
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
-    
-    if (error) {
+    if (deserializeJson(doc, server.arg("plain"))) {
         server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         return;
     }
     
-    String sequenceId = doc["sequenceId"] | "";
+    String seqId = doc["sequenceId"] | "";
     
-    if (playSequence(sequenceId)) {
+    if (playSequence(seqId)) {
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(500, "application/json", "{\"error\":\"Failed to play sequence\"}");
@@ -365,6 +381,14 @@ void LightCommander::handlePauseSequence() {
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(500, "application/json", "{\"error\":\"Not playing\"}");
+    }
+}
+
+void LightCommander::handleResumeSequence() {
+    if (resumeSequence()) {
+        server.send(200, "application/json", "{\"success\":true}");
+    } else {
+        server.send(500, "application/json", "{\"error\":\"Cannot resume\"}");
     }
 }
 
@@ -383,24 +407,22 @@ void LightCommander::handleStopSequence() {
 bool LightCommander::addSpotlight(const String& id, const String& name, const String& ip) {
     Spotlight spot;
     spot.id = id;
-    spot.name = name.isEmpty() ? id : name;
+    spot.name = name;
     spot.ip = ip;
-    spot.online = true;
-    spot.lastSeen = millis();
+    spot.online = false;
     
     spotlights[id] = spot;
     
     Serial.printf("Added spotlight: %s (%s) at %s\n", id.c_str(), name.c_str(), ip.c_str());
+    
+    // Sofort checken ob online
+    checkSpotlightStatus();
+    
     return true;
 }
 
 bool LightCommander::removeSpotlight(const String& id) {
-    auto it = spotlights.find(id);
-    if (it != spotlights.end()) {
-        spotlights.erase(it);
-        return true;
-    }
-    return false;
+    return spotlights.erase(id) > 0;
 }
 
 Spotlight* LightCommander::getSpotlight(const String& id) {
@@ -419,21 +441,15 @@ std::vector<Spotlight*> LightCommander::getAllSpotlights() {
     return result;
 }
 
-void LightCommander::discoverSpotlights() {
-    // TODO: Implementiere mDNS Discovery für WLED-Geräte
-    // Für jetzt: Manuelles Hinzufügen über API
-    Serial.println("Discovery not yet implemented. Use API to add spotlights.");
-}
-
 void LightCommander::checkSpotlightStatus() {
     HTTPClient http;
     
     for (auto& pair : spotlights) {
         Spotlight& spot = pair.second;
         
-        String url = "http://" + spot.ip + "/json/info";
+        String url = "http://" + spot.ip + "/status";
         http.begin(url);
-        http.setTimeout(2000);
+        http.setTimeout(3000);
         
         int httpCode = http.GET();
         
@@ -452,65 +468,145 @@ void LightCommander::checkSpotlightStatus() {
 // EFFEKT-STEUERUNG
 // ============================================================================
 
-bool LightCommander::sendEffect(const std::vector<String>& targets, RingType ring, 
+bool LightCommander::sendEffect(const std::vector<String>& targets, RingType ring,
                                  EffectType effect, const EffectParams& params) {
-    bool success = true;
+    bool allSuccess = true;
     
     for (const String& targetId : targets) {
         Spotlight* spot = getSpotlight(targetId);
-        if (!spot || !spot->online) {
-            Serial.printf("Spotlight %s not available\n", targetId.c_str());
-            success = false;
+        if (!spot) {
+            Serial.printf("✗ Spotlight '%s' not found\n", targetId.c_str());
+            allSuccess = false;
             continue;
         }
         
-        // Für Rotation: State speichern
-        if (effect == EFFECT_ROTATION) {
-            RotationState state;
-            state.active = true;
-            state.currentPosition = params.rotation.startOffset;
-            state.lastUpdate = millis();
-            state.params = params.rotation;
-            state.ring = ring;
-            rotationStates[targetId] = state;
-        }
+        Serial.printf("→ Sending to %s (%s)...\n", targetId.c_str(), spot->ip.c_str());
         
-        String json = buildWLEDJson(ring, effect, params);
-        if (!sendToWLED(spot->ip, json)) {
-            success = false;
+        String json = buildEffectJson(ring, effect, params);
+        
+        if (!sendToSpotlight(spot->ip, json)) {
+            Serial.printf("✗ Failed to send to %s\n", targetId.c_str());
+            allSuccess = false;
+        } else {
+            Serial.printf("✓ Sent to %s\n", targetId.c_str());
         }
     }
     
-    return success;
+    return allSuccess;
 }
 
-bool LightCommander::stopEffect(const std::vector<String>& targets) {
-    bool success = true;
+bool LightCommander::stopEffect(const std::vector<String>& targets, RingType ring) {
+    bool allSuccess = true;
     
     for (const String& targetId : targets) {
         Spotlight* spot = getSpotlight(targetId);
         if (!spot) continue;
         
-        // Rotation stoppen
-        rotationStates.erase(targetId);
+        HTTPClient http;
+        String url = "http://" + spot->ip + "/stop";
+        http.begin(url);
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(5000);
         
-        // WLED ausschalten
-        String json = "{\"on\":false}";
-        if (!sendToWLED(spot->ip, json)) {
-            success = false;
+        // Ring als JSON senden
+        StaticJsonDocument<128> doc;
+        if (ring == RING_INNER) doc["ring"] = "inner";
+        else if (ring == RING_OUTER) doc["ring"] = "outer";
+        else doc["ring"] = "both";
+        
+        String json;
+        serializeJson(doc, json);
+        
+        int httpCode = http.POST(json);
+        if (httpCode != 200) {
+            allSuccess = false;
         }
+        
+        http.end();
     }
     
+    return allSuccess;
+}
+
+bool LightCommander::sendToSpotlight(const String& ip, const String& json) {
+    HTTPClient http;
+    String url = "http://" + ip + "/effect";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(5000);
+    
+    int httpCode = http.POST(json);
+    bool success = (httpCode == 200);
+    
+    if (!success) {
+        Serial.printf("HTTP Error: %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
     return success;
 }
 
-bool LightCommander::setColor(const std::vector<String>& targets, RingType ring, 
-                               const Color& color, uint8_t brightness) {
-    EffectParams params;
-    params.color = color;
-    params.brightness = brightness;
+String LightCommander::buildEffectJson(RingType ring, EffectType effect, const EffectParams& params) {
+    StaticJsonDocument<2048> doc;
     
-    return sendEffect(targets, ring, EFFECT_STATIC, params);
+    // Ring
+    if (ring == RING_INNER) doc["ring"] = "inner";
+    else if (ring == RING_OUTER) doc["ring"] = "outer";
+    else doc["ring"] = "both";
+    
+    // Effekt
+    if (effect == EFFECT_STATIC) doc["effect"] = "static";
+    else if (effect == EFFECT_FADE) doc["effect"] = "fade";
+    else if (effect == EFFECT_STROBE) doc["effect"] = "strobe";
+    else if (effect == EFFECT_PULSE) doc["effect"] = "pulse";
+    else if (effect == EFFECT_ROTATION) doc["effect"] = "rotation";
+    else if (effect == EFFECT_RAINBOW) doc["effect"] = "rainbow";
+    else if (effect == EFFECT_CHASE) doc["effect"] = "chase";
+    
+    // Farbe
+    JsonArray color = doc.createNestedArray("color");
+    color.add(params.color.r);
+    color.add(params.color.g);
+    color.add(params.color.b);
+    
+    // Brightness
+    doc["brightness"] = params.brightness;
+    
+    // Speed/Duration
+    if (params.speed > 0) doc["speed"] = params.speed;
+    if (params.duration > 0) doc["duration"] = params.duration;
+    
+    // Rotation
+    if (effect == EFFECT_ROTATION) {
+        JsonObject rot = doc.createNestedObject("rotation");
+        
+        JsonArray activeColor = rot.createNestedArray("activeColor");
+        activeColor.add(params.rotation.activeColor.r);
+        activeColor.add(params.rotation.activeColor.g);
+        activeColor.add(params.rotation.activeColor.b);
+        
+        JsonArray inactiveColor = rot.createNestedArray("inactiveColor");
+        inactiveColor.add(params.rotation.inactiveColor.r);
+        inactiveColor.add(params.rotation.inactiveColor.g);
+        inactiveColor.add(params.rotation.inactiveColor.b);
+        
+        rot["speed"] = params.rotation.speed;
+        rot["direction"] = (params.rotation.direction == DIRECTION_CLOCKWISE) ? 
+            "clockwise" : "counterclockwise";
+        
+        if (params.rotation.pattern == PATTERN_SINGLE) rot["pattern"] = "single";
+        else if (params.rotation.pattern == PATTERN_TRAIL) {
+            rot["pattern"] = "trail";
+            rot["trailLength"] = params.rotation.trailLength;
+        }
+        else if (params.rotation.pattern == PATTERN_OPPOSITE) rot["pattern"] = "opposite";
+        else if (params.rotation.pattern == PATTERN_WAVE) rot["pattern"] = "wave";
+    }
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
 }
 
 // ============================================================================
@@ -518,11 +614,10 @@ bool LightCommander::setColor(const std::vector<String>& targets, RingType ring,
 // ============================================================================
 
 bool LightCommander::loadSequence(const String& json) {
-    DynamicJsonDocument doc(8192);
-    DeserializationError error = deserializeJson(doc, json);
+    DynamicJsonDocument doc(16384);
     
-    if (error) {
-        Serial.println("Failed to parse sequence JSON");
+    if (deserializeJson(doc, json)) {
+        Serial.println("✗ Failed to parse sequence JSON");
         return false;
     }
     
@@ -531,8 +626,6 @@ bool LightCommander::loadSequence(const String& json) {
     seq.name = doc["name"] | "";
     seq.duration = doc["duration"] | 0;
     seq.loop = doc["loop"] | false;
-    
-    // Spotify-Felder (für später)
     seq.spotifyUri = doc["spotifyUri"] | "";
     seq.syncWithSpotify = doc["syncWithSpotify"] | false;
     
@@ -564,7 +657,7 @@ bool LightCommander::loadSequence(const String& json) {
         else if (effectStr == "chase") event.effect = EFFECT_CHASE;
         else event.effect = EFFECT_STATIC;
         
-        // Params (vereinfacht - nur wichtigste)
+        // Params
         JsonObject params = eventObj["params"];
         if (params.containsKey("color")) {
             JsonArray c = params["color"];
@@ -575,6 +668,9 @@ bool LightCommander::loadSequence(const String& json) {
         }
         if (params.containsKey("duration")) {
             event.params.duration = params["duration"];
+        }
+        if (params.containsKey("speed")) {
+            event.params.speed = params["speed"];
         }
         
         // Rotation params
@@ -591,6 +687,21 @@ bool LightCommander::loadSequence(const String& json) {
             if (rot.containsKey("speed")) {
                 event.params.rotation.speed = rot["speed"];
             }
+            if (rot.containsKey("direction")) {
+                String dir = rot["direction"] | "clockwise";
+                event.params.rotation.direction = (dir == "counterclockwise") ? 
+                    DIRECTION_COUNTERCLOCKWISE : DIRECTION_CLOCKWISE;
+            }
+            if (rot.containsKey("pattern")) {
+                String pat = rot["pattern"] | "single";
+                if (pat == "trail") event.params.rotation.pattern = PATTERN_TRAIL;
+                else if (pat == "opposite") event.params.rotation.pattern = PATTERN_OPPOSITE;
+                else if (pat == "wave") event.params.rotation.pattern = PATTERN_WAVE;
+                else event.params.rotation.pattern = PATTERN_SINGLE;
+            }
+            if (rot.containsKey("trailLength")) {
+                event.params.rotation.trailLength = rot["trailLength"];
+            }
         }
         
         seq.events.push_back(event);
@@ -598,13 +709,7 @@ bool LightCommander::loadSequence(const String& json) {
     
     sequences[seq.id] = seq;
     
-    Serial.printf("Loaded sequence: %s (%d events)\n", seq.name.c_str(), seq.events.size());
-    return true;
-}
-
-bool LightCommander::saveSequence(const Sequence& seq) {
-    // TODO: Speichere Sequenz in SPIFFS
-    sequences[seq.id] = seq;
+    Serial.printf("✓ Loaded sequence '%s' with %d events\n", seq.name.c_str(), seq.events.size());
     return true;
 }
 
@@ -624,60 +729,47 @@ std::vector<String> LightCommander::listSequences() {
     return result;
 }
 
-bool LightCommander::deleteSequence(const String& id) {
-    auto it = sequences.find(id);
-    if (it != sequences.end()) {
-        sequences.erase(it);
-        return true;
-    }
-    return false;
-}
-
 // ============================================================================
 // SEQUENZ-PLAYBACK
 // ============================================================================
 
 bool LightCommander::playSequence(const String& sequenceId) {
-    currentSequence = getSequence(sequenceId);
-    if (!currentSequence) {
-        Serial.printf("Sequence %s not found\n", sequenceId.c_str());
+    Sequence* seq = getSequence(sequenceId);
+    if (!seq) {
+        Serial.printf("✗ Sequence '%s' not found\n", sequenceId.c_str());
         return false;
     }
     
     playback.active = true;
     playback.currentSequence = sequenceId;
     playback.startTime = millis();
-    playback.position = 0;
     playback.paused = false;
+    currentSequence = seq;
     currentEventIndex = 0;
     
-    Serial.printf("Playing sequence: %s\n", currentSequence->name.c_str());
-    
-    // TODO: Hier später Spotify starten, wenn syncWithSpotify = true
-    // if (currentSequence->syncWithSpotify && !currentSequence->spotifyUri.isEmpty()) {
-    //     playSpotifyTrack(currentSequence->spotifyUri);
-    // }
-    
+    Serial.printf("▶️ Playing sequence '%s'\n", seq->name.c_str());
     return true;
 }
 
 bool LightCommander::pauseSequence() {
-    if (!playback.active) return false;
+    if (!playback.active || playback.paused) return false;
     
     playback.paused = true;
-    playback.position = millis() - playback.startTime;
+    playback.pauseTime = millis();
     
-    Serial.println("Sequence paused");
+    Serial.println("⏸️ Sequence paused");
     return true;
 }
 
 bool LightCommander::resumeSequence() {
     if (!playback.active || !playback.paused) return false;
     
+    // Zeit korrigieren
+    unsigned long pauseDuration = millis() - playback.pauseTime;
+    playback.startTime += pauseDuration;
     playback.paused = false;
-    playback.startTime = millis() - playback.position;
     
-    Serial.println("Sequence resumed");
+    Serial.println("▶️ Sequence resumed");
     return true;
 }
 
@@ -686,47 +778,21 @@ bool LightCommander::stopSequence() {
     
     playback.active = false;
     playback.paused = false;
-    playback.currentSequence = "";
     currentSequence = nullptr;
     currentEventIndex = 0;
     
-    // Alle Effekte stoppen
-    std::vector<String> allTargets;
-    for (auto& pair : spotlights) {
-        allTargets.push_back(pair.first);
-    }
-    stopEffect(allTargets);
-    
-    Serial.println("Sequence stopped");
+    Serial.println("⏹️ Sequence stopped");
     return true;
 }
 
-PlaybackState LightCommander::getPlaybackState() {
-    if (playback.active && !playback.paused) {
-        playback.position = millis() - playback.startTime;
-    }
-    return playback;
-}
-
 void LightCommander::updateSequencePlayback() {
-    if (!currentSequence || currentEventIndex >= currentSequence->events.size()) {
-        // Sequenz beendet
-        if (currentSequence && currentSequence->loop) {
-            // Loop: Neu starten
-            playback.startTime = millis();
-            playback.position = 0;
-            currentEventIndex = 0;
-        } else {
-            stopSequence();
-        }
-        return;
-    }
+    if (!currentSequence || !playback.active) return;
     
     unsigned long currentTime = millis() - playback.startTime;
     
-    // Prüfe, ob nächstes Event ausgelöst werden muss
+    // Events abarbeiten
     while (currentEventIndex < currentSequence->events.size()) {
-        const SequenceEvent& event = currentSequence->events[currentEventIndex];
+        SequenceEvent& event = currentSequence->events[currentEventIndex];
         
         if (currentTime >= event.timestamp) {
             processSequenceEvent(event);
@@ -735,187 +801,47 @@ void LightCommander::updateSequencePlayback() {
             break;
         }
     }
+    
+    // Ende erreicht?
+    if (currentEventIndex >= currentSequence->events.size()) {
+        if (currentSequence->loop) {
+            // Loop
+            currentEventIndex = 0;
+            playback.startTime = millis();
+            Serial.println("🔄 Sequence looping...");
+        } else {
+            // Stoppen
+            stopSequence();
+            Serial.println("✓ Sequence complete");
+        }
+    }
 }
 
 void LightCommander::processSequenceEvent(const SequenceEvent& event) {
-    Serial.printf("Executing event at %lu ms\n", event.timestamp);
+    Serial.printf("⚡ Event @ %lums\n", event.timestamp);
     sendEffect(event.targets, event.ring, event.effect, event.params);
 }
 
 // ============================================================================
-// ROTATION UPDATE
-// ============================================================================
-
-void LightCommander::updateRotationEffects() {
-    unsigned long now = millis();
-    
-    for (auto& pair : rotationStates) {
-        String spotId = pair.first;
-        RotationState& state = pair.second;
-        
-        if (!state.active) continue;
-        
-        // Zeit für nächsten Step?
-        if (now - state.lastUpdate >= state.params.speed) {
-            state.lastUpdate = now;
-            
-            // Position aktualisieren
-            if (state.params.direction == DIRECTION_CLOCKWISE) {
-                state.currentPosition++;
-            } else {
-                state.currentPosition--;
-            }
-            
-            // LED-Count abhängig vom Ring
-            Spotlight* spot = getSpotlight(spotId);
-            if (!spot) continue;
-            
-            uint8_t ledCount = (state.ring == RING_INNER) ? 
-                spot->innerLedCount : spot->outerLedCount;
-            
-            state.currentPosition = state.currentPosition % ledCount;
-            
-            // Neues Pattern an WLED senden
-            String json = buildRotationPatternJson(state, ledCount);
-            sendToWLED(spot->ip, json);
-        }
-    }
-}
-
-// ============================================================================
-// WLED KOMMUNIKATION
-// ============================================================================
-
-bool LightCommander::sendToWLED(const String& ip, const String& json) {
-    HTTPClient http;
-    String url = "http://" + ip + "/json/state";
-    
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    
-    int httpCode = http.POST(json);
-    bool success = (httpCode == 200);
-    
-    if (!success) {
-        Serial.printf("WLED request failed: %d\n", httpCode);
-    }
-    
-    http.end();
-    return success;
-}
-
-String LightCommander::buildWLEDJson(RingType ring, EffectType effect, const EffectParams& params) {
-    StaticJsonDocument<1024> doc;
-    
-    doc["on"] = true;
-    doc["bri"] = params.brightness;
-    
-    JsonArray seg = doc.createNestedArray("seg");
-    
-    // Segmente für Ringe erstellen
-    if (ring == RING_INNER || ring == RING_BOTH) {
-        JsonObject innerSeg = seg.createNestedObject();
-        innerSeg["id"] = 0;
-        innerSeg["start"] = 0;
-        innerSeg["stop"] = 8;
-        
-        JsonArray col = innerSeg.createNestedArray("col");
-        JsonArray c1 = col.createNestedArray();
-        c1.add(params.color.r);
-        c1.add(params.color.g);
-        c1.add(params.color.b);
-        
-        // Effekt-Mapping auf WLED
-        switch (effect) {
-            case EFFECT_STATIC: innerSeg["fx"] = 0; break;
-            case EFFECT_FADE: innerSeg["fx"] = 1; break;
-            case EFFECT_STROBE: innerSeg["fx"] = 2; break;
-            case EFFECT_PULSE: innerSeg["fx"] = 3; break;
-            case EFFECT_RAINBOW: innerSeg["fx"] = 9; break;
-            case EFFECT_CHASE: innerSeg["fx"] = 28; break;
-            default: innerSeg["fx"] = 0;
-        }
-    }
-    
-    if (ring == RING_OUTER || ring == RING_BOTH) {
-        JsonObject outerSeg = seg.createNestedObject();
-        outerSeg["id"] = 1;
-        outerSeg["start"] = 8;
-        outerSeg["stop"] = 34;
-        
-        JsonArray col = outerSeg.createNestedArray("col");
-        JsonArray c1 = col.createNestedArray();
-        c1.add(params.color.r);
-        c1.add(params.color.g);
-        c1.add(params.color.b);
-        
-        switch (effect) {
-            case EFFECT_STATIC: outerSeg["fx"] = 0; break;
-            case EFFECT_FADE: outerSeg["fx"] = 1; break;
-            case EFFECT_STROBE: outerSeg["fx"] = 2; break;
-            case EFFECT_PULSE: outerSeg["fx"] = 3; break;
-            case EFFECT_RAINBOW: outerSeg["fx"] = 9; break;
-            case EFFECT_CHASE: outerSeg["fx"] = 28; break;
-            default: outerSeg["fx"] = 0;
-        }
-    }
-    
-    String output;
-    serializeJson(doc, output);
-    return output;
-}
-
-String LightCommander::buildRotationPatternJson(const RotationState& state, uint8_t ledCount) {
-    // Für Rotation: Individuelles LED-Array per UDP würde besser funktionieren
-    // Aber für Proof-of-Concept: Nutze WLED Chase-Effekt mit Anpassungen
-    
-    StaticJsonDocument<512> doc;
-    doc["on"] = true;
-    doc["bri"] = 255;
-    
-    JsonArray seg = doc.createNestedArray("seg");
-    JsonObject segment = seg.createNestedObject();
-    segment["id"] = (state.ring == RING_INNER) ? 0 : 1;
-    segment["fx"] = 28; // Chase
-    segment["sx"] = map(state.params.speed, 10, 500, 255, 10);
-    segment["ix"] = state.currentPosition * (255 / ledCount);
-    
-    JsonArray col = segment.createNestedArray("col");
-    JsonArray c1 = col.createNestedArray();
-    c1.add(state.params.activeColor.r);
-    c1.add(state.params.activeColor.g);
-    c1.add(state.params.activeColor.b);
-    
-    JsonArray c2 = col.createNestedArray();
-    c2.add(state.params.inactiveColor.r);
-    c2.add(state.params.inactiveColor.g);
-    c2.add(state.params.inactiveColor.b);
-    
-    String output;
-    serializeJson(doc, output);
-    return output;
-}
-
-// ============================================================================
-// STATUS & HILFSFUNKTIONEN
+// STATUS
 // ============================================================================
 
 String LightCommander::getStatusJson() {
     StaticJsonDocument<2048> doc;
     
-    // System Info
     doc["uptime"] = millis();
     doc["freeHeap"] = ESP.getFreeHeap();
     doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
     doc["ip"] = isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
     
-    // Playback Status
+    // Playback
     JsonObject pb = doc.createNestedObject("playback");
     pb["active"] = playback.active;
     pb["sequence"] = playback.currentSequence;
-    pb["position"] = playback.paused ? playback.position : (millis() - playback.startTime);
     pb["paused"] = playback.paused;
-    pb["spotifyConnected"] = playback.spotifyConnected;
+    if (playback.active) {
+        pb["position"] = millis() - playback.startTime;
+    }
     
     // Devices
     JsonArray devices = doc.createNestedArray("devices");
@@ -923,52 +849,11 @@ String LightCommander::getStatusJson() {
         JsonObject dev = devices.createNestedObject();
         dev["id"] = pair.second.id;
         dev["name"] = pair.second.name;
-        dev["online"] = pair.second.online;
         dev["ip"] = pair.second.ip;
+        dev["online"] = pair.second.online;
     }
     
     String output;
     serializeJson(doc, output);
     return output;
-}
-
-Color LightCommander::blendColor(const Color& c1, const Color& c2, float factor) {
-    return Color(
-        c1.r * factor + c2.r * (1.0 - factor),
-        c1.g * factor + c2.g * (1.0 - factor),
-        c1.b * factor + c2.b * (1.0 - factor)
-    );
-}
-
-String LightCommander::colorToJson(const Color& c) {
-    return "[" + String(c.r) + "," + String(c.g) + "," + String(c.b) + "]";
-}
-
-unsigned long LightCommander::getCurrentTime() {
-    return millis();
-}
-
-// ============================================================================
-// SPOTIFY PLATZHALTER (Für spätere Integration)
-// ============================================================================
-
-bool LightCommander::connectSpotify(const String& clientId, const String& clientSecret) {
-    // TODO: OAuth2 Flow implementieren
-    // TODO: Access Token erhalten
-    // TODO: Token speichern
-    Serial.println("Spotify integration not yet implemented");
-    return false;
-}
-
-bool LightCommander::playSpotifyTrack(const String& uri) {
-    // TODO: Spotify Web API aufrufen
-    // POST https://api.spotify.com/v1/me/player/play
-    Serial.println("Spotify playback not yet implemented");
-    return false;
-}
-
-unsigned long LightCommander::getSpotifyPosition() {
-    // TODO: Aktuelle Track-Position von Spotify abrufen
-    // GET https://api.spotify.com/v1/me/player
-    return 0;
 }
